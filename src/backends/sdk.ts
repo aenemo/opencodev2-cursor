@@ -1,8 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { createInterface } from "node:readline"
+import { randomUUID } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import type { BackendEvent, BackendRunRequest, CursorBackend, CursorModel } from "./types.js"
-import { FALLBACK_MODELS, MODEL_CONTEXT_WINDOW, MODEL_MAX_TOKENS } from "./types.js"
+import { FALLBACK_MODELS, MODEL_CONTEXT_WINDOW, MODEL_MAX_TOKENS, promptWithToolResults } from "./types.js"
 import { expandSdkModels, type SdkListedModel } from "./sdk-models.js"
 import { assertNodeForSdk, nodeBinary } from "./spawn.js"
 import { modelSelectionKey } from "./auto-models.js"
@@ -10,10 +11,18 @@ import { compileCacheDir, sdkStateDir } from "../util/paths.js"
 import { readCheckpoint, writeCheckpoint } from "./checkpoint.js"
 import { log } from "../util/log.js"
 import { mapCursorTool } from "../proxy/tools.js"
+import { createModelCache, type ModelCache } from "./model-cache.js"
+
+export const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+export const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000
+/** The runner sends this when a tool result has no paused run. The parent starts a fresh turn instead of failing the chat. */
+export const ORPHAN_TOOL_RESULT = "Tool result arrived after the Cursor run ended"
 
 interface RunnerEvent {
   type: string
   id?: string
+  requestId?: string
+  sessionKey?: string
   name?: string
   text?: string
   message?: string
@@ -23,11 +32,29 @@ interface RunnerEvent {
   ms?: number
   cwd?: string
   prewarmed?: boolean
+  event?: string
+  reason?: string
+  toolId?: string
+  model?: string
 }
 
-class SdkRunner {
-  readonly events: RunnerEvent[] = []
-  private waiters: Array<(event: RunnerEvent) => void> = []
+interface RunnerTransport {
+  readonly alive: boolean
+  send(message: unknown): void
+  next(lane: string): Promise<RunnerEvent>
+  discard(lane: string): void
+  kill(): void
+}
+
+interface Lane {
+  events: RunnerEvent[]
+  waiters: Array<(event: RunnerEvent) => void>
+}
+
+class SdkRunner implements RunnerTransport {
+  private lanes = new Map<string, Lane>()
+  private closed = new Set<string>()
+  private dead: RunnerEvent | undefined
   private child: ChildProcessWithoutNullStreams
   agentId: string | undefined
   alive = true
@@ -42,41 +69,85 @@ class SdkRunner {
       } catch {
         return
       }
+      if (event.type === "diag") {
+        log("info", event.event || "sdk", {
+          sessionKey: event.sessionKey,
+          model: event.model,
+          reason: event.reason,
+          toolId: event.toolId,
+        })
+        return
+      }
       if (event.type === "session" && event.agentId) this.agentId = event.agentId
       if (event.type === "warn" && event.message) log("warn", "sdk runner", event.message)
       if (event.type === "idle" || event.type === "pong" || event.type === "warn") return
-      this.push(event)
+      this.deliver(event)
     })
     child.on("exit", (code) => {
-      this.alive = false
-      this.push({ type: "error", message: `Cursor SDK runner exited (${code ?? "signal"})` })
+      this.failAll(`Cursor SDK runner exited (${code ?? "signal"})`)
     })
   }
 
-  private push(event: RunnerEvent): void {
-    const waiter = this.waiters.shift()
+  private laneKey(event: RunnerEvent): string {
+    if (event.requestId) return event.requestId
+    if (event.id) return event.id
+    if (event.sessionKey) return event.sessionKey
+    return "default"
+  }
+
+  private lane(key: string): Lane {
+    let found = this.lanes.get(key)
+    if (!found) {
+      found = { events: [], waiters: [] }
+      this.lanes.set(key, found)
+    }
+    return found
+  }
+
+  private deliver(event: RunnerEvent): void {
+    if (this.dead) return
+    const key = this.laneKey(event)
+    if (this.closed.has(key)) return
+    const bucket = this.lane(key)
+    const waiter = bucket.waiters.shift()
     if (waiter) waiter(event)
-    else this.events.push(event)
+    else bucket.events.push(event)
+  }
+
+  private failAll(message: string): void {
+    if (this.dead) return
+    this.alive = false
+    this.dead = { type: "error", message }
+    for (const bucket of this.lanes.values()) {
+      if (bucket.waiters.length === 0) bucket.events.push({ ...this.dead })
+      while (bucket.waiters.length > 0) bucket.waiters.shift()?.({ ...this.dead })
+    }
   }
 
   send(message: unknown): void {
     this.child.stdin.write(JSON.stringify(message) + "\n")
   }
 
-  next(): Promise<RunnerEvent> {
-    const queued = this.events.shift()
+  next(laneKey: string): Promise<RunnerEvent> {
+    if (this.dead) return Promise.resolve({ ...this.dead })
+    const bucket = this.lane(laneKey)
+    const queued = bucket.events.shift()
     if (queued) return Promise.resolve(queued)
-    return new Promise((resolve) => this.waiters.push(resolve))
+    return new Promise((resolve) => bucket.waiters.push(resolve))
   }
 
-  cancel(): void {
+  discard(laneKey: string): void {
+    this.closed.add(laneKey)
+    this.lanes.delete(laneKey)
+  }
+
+  kill(): void {
+    this.alive = false
     try {
-      this.send({ type: "cancel" })
+      this.child.kill()
     } catch {
       // Process may already be gone.
     }
-    this.child.kill()
-    this.alive = false
   }
 }
 
@@ -94,7 +165,7 @@ function runnerScript(): string {
   return fileURLToPath(new URL("./sdk-runner.mjs", import.meta.url))
 }
 
-function startRunner(): SdkRunner {
+function startRunner(): RunnerTransport {
   if (!process.env.CURSOR_ACP_NODE_BIN) assertNodeForSdk()
   const child = spawn(nodeBinary(), [runnerScript()], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -108,9 +179,28 @@ function startRunner(): SdkRunner {
   return new SdkRunner(child)
 }
 
+function signalMessage(signal: AbortSignal): string {
+  const reason = signal.reason
+  if (typeof reason === "string" && reason) return reason
+  if (reason instanceof Error && reason.message) return reason.message
+  return "Client aborted the Cursor turn"
+}
+
+function isTimeoutMessage(message: string): boolean {
+  return message.startsWith("No Cursor output") || message.startsWith("Cursor turn timed out")
+}
+
 export interface RememberedAgent {
   agentId: string
   modelKey: string
+}
+
+export interface SdkBackendOptions {
+  idleTimeoutMs?: number
+  turnTimeoutMs?: number
+  modelsCacheTtlMs?: number
+  /** Test hook. The default spawns the long-lived SDK worker. */
+  connect?: () => RunnerTransport
 }
 
 /** Resume only when the stored agent was created for this model and its params. */
@@ -130,133 +220,220 @@ export function resumeAgentId(
   return undefined
 }
 
-/** One long-lived Node worker. Chat sessions reuse it by resuming different agent IDs inside the same process. */
+/**
+ * One long-lived Node worker, with a separate agent, run, and lock per OpenCode session.
+ * A turn in one session cannot cancel a run that another session has paused on a tool call.
+ */
 export class SdkBackend implements CursorBackend {
   readonly id = "sdk" as const
-  private warm: SdkRunner | undefined
+  private runner: RunnerTransport | undefined
   private sessionAgents = new Map<string, RememberedAgent>()
-  private lock: Promise<void> = Promise.resolve()
+  private sessionLocks = new Map<string, Promise<void>>()
+  private prewarms = new Map<string, Promise<void>>()
+  private readonly models: ModelCache
+  private readonly connect: () => RunnerTransport
+  private readonly idleTimeoutMs: number
+  private readonly turnTimeoutMs: number
 
-  constructor(private readonly apiKey: () => Promise<string>) {}
-
-  private ensureWarm(): SdkRunner {
-    if (this.warm?.alive) return this.warm
-    this.warm = startRunner()
-    log("info", "sdk worker started")
-    return this.warm
+  constructor(private readonly apiKey: () => Promise<string>, options?: SdkBackendOptions) {
+    this.connect = options?.connect ?? startRunner
+    this.idleTimeoutMs = options?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+    this.turnTimeoutMs = options?.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
+    this.models = createModelCache({ ttlMs: options?.modelsCacheTtlMs })
   }
 
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    let release!: () => void
-    const previous = this.lock
-    this.lock = new Promise((resolve) => {
-      release = resolve
-    })
-    await previous
+  private ensureRunner(): RunnerTransport {
+    if (this.runner?.alive) return this.runner
+    this.prewarms.clear()
+    this.runner = this.connect()
+    log("info", "sdk worker started")
+    return this.runner
+  }
+
+  private async prewarm(cwd: string): Promise<void> {
+    const existing = this.prewarms.get(cwd)
+    if (existing) return existing
+    const flight = this.sendPrewarm(cwd)
+    this.prewarms.set(cwd, flight)
     try {
-      return await fn()
-    } finally {
-      release()
+      await flight
+    } catch (error) {
+      this.prewarms.delete(cwd)
+      throw error
     }
   }
 
+  private async sendPrewarm(cwd: string): Promise<void> {
+    const apiKey = await this.apiKey()
+    const runner = this.ensureRunner()
+    const id = `prewarm:${randomUUID()}`
+    runner.send({ type: "prewarm", id, apiKey, cwd, stateRoot: sdkStateDir(cwd) })
+    const event = await runner.next(id)
+    runner.discard(id)
+    if (event.type === "error") throw new Error(event.message || "SDK prewarm failed")
+  }
+
+  private async requestModels(cwd: string): Promise<CursorModel[]> {
+    const apiKey = await this.apiKey()
+    const runner = this.ensureRunner()
+    const id = `models:${randomUUID()}`
+    runner.send({ type: "models", id, apiKey, cwd, stateRoot: cwd ? sdkStateDir(cwd) : undefined })
+    const event = await runner.next(id)
+    runner.discard(id)
+    if (event.type === "error") throw new Error(event.message || "SDK model list failed")
+    const models = stampModels(event.models ?? [])
+    return models.length > 0 ? models : FALLBACK_MODELS
+  }
+
   async warmUp(cwd: string): Promise<CursorModel[]> {
-    return this.withLock(async () => {
-      const started = Date.now()
-      const apiKey = await this.apiKey()
-      const runner = this.ensureWarm()
-      runner.send({
-        type: "warm",
-        id: "warm",
-        apiKey,
-        cwd,
-        stateRoot: sdkStateDir(cwd),
-      })
-      const event = await runner.next()
-      if (event.type === "error") throw new Error(event.message || "SDK warm-up failed")
-      const models = stampModels(event.models ?? [])
-      log("info", "sdk worker warmed", {
-        ms: event.ms ?? Date.now() - started,
-        models: models.length,
-        prewarmed: event.prewarmed === true,
-        cwd: event.cwd || cwd,
-      })
-      return models.length > 0 ? models : FALLBACK_MODELS
-    })
+    try {
+      await this.prewarm(cwd)
+    } catch (error) {
+      log("warn", "sdk prewarm failed", error instanceof Error ? error.message : error)
+    }
+    return this.models.load(() => this.requestModels(cwd))
   }
 
   async listModels(): Promise<CursorModel[]> {
-    return this.withLock(async () => {
-      const apiKey = await this.apiKey()
-      const runner = this.ensureWarm()
-      runner.send({ type: "models", id: "models", apiKey })
-      const event = await runner.next()
-      if (event.type === "error") {
-        log("warn", "sdk model list failed", event.message)
-        return FALLBACK_MODELS
-      }
-      const models = stampModels(event.models ?? [])
-      if (models.length === 0) return FALLBACK_MODELS
-      return models
-    })
+    return this.models.load(() => this.requestModels(""))
   }
 
   async *run(request: BackendRunRequest): AsyncIterable<BackendEvent> {
+    const key = request.sessionKey || "default"
     let release!: () => void
-    const previous = this.lock
-    this.lock = new Promise((resolve) => {
+    const previous = this.sessionLocks.get(key) ?? Promise.resolve()
+    const gate = new Promise<void>((resolve) => {
       release = resolve
     })
-    await previous
-    const turnStarted = Date.now()
-    try {
-      yield* this.runLocked(request, turnStarted)
-    } finally {
+    this.sessionLocks.set(key, gate)
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
       release()
+    }
+    try {
+      if (request.signal.aborted) return
+      const aborted = new Promise<"abort">((resolve) => {
+        request.signal.addEventListener("abort", () => resolve("abort"), { once: true })
+      })
+      const waited = await Promise.race([previous.then(() => "ready" as const), aborted])
+      if (waited === "abort" || request.signal.aborted) {
+        log("info", "client abort", {
+          sessionKey: request.sessionKey,
+          model: request.model,
+          reason: "queued behind another turn",
+        })
+        return
+      }
+      const turnStarted = Date.now()
+      // Release before yielding a terminal event. The caller stops reading there, so code
+      // after that yield, including finally, would not run and the next turn would wait forever.
+      for await (const event of this.runLocked(request, turnStarted)) {
+        if (event.type === "tool_call" || event.type === "done" || event.type === "error") releaseOnce()
+        yield event
+      }
+    } finally {
+      releaseOnce()
+    }
+  }
+
+  private async nextEvent(
+    runner: RunnerTransport,
+    lane: string,
+    signal: AbortSignal,
+    deadline: number,
+  ): Promise<RunnerEvent | "abort" | "idle" | "overall"> {
+    if (signal.aborted) return "abort"
+    const overallLeft = deadline - Date.now()
+    if (overallLeft <= 0) return "overall"
+    const idleLimited = overallLeft > this.idleTimeoutMs
+    const waitMs = idleLimited ? this.idleTimeoutMs : overallLeft
+    let timer: NodeJS.Timeout | undefined
+    const timeout = new Promise<"idle" | "overall">((resolve) => {
+      timer = setTimeout(() => resolve(idleLimited ? "idle" : "overall"), waitMs)
+    })
+    const aborted = new Promise<"abort">((resolve) => {
+      signal.addEventListener("abort", () => resolve("abort"), { once: true })
+    })
+    try {
+      return await Promise.race([runner.next(lane), timeout, aborted])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  private cancelRun(runner: RunnerTransport, request: BackendRunRequest, requestId: string, reason: string): void {
+    log("info", isTimeoutMessage(reason) ? "timeout" : "client abort", {
+      sessionKey: request.sessionKey,
+      model: request.model,
+      reason,
+    })
+    log("info", "run cancelled", { sessionKey: request.sessionKey, model: request.model, reason })
+    try {
+      runner.send({ type: "cancel", sessionKey: request.sessionKey, requestId, reason, model: request.model })
+    } catch {
+      // The worker is already gone.
     }
   }
 
   private async *runLocked(request: BackendRunRequest, turnStarted: number): AsyncIterable<BackendEvent> {
-    const apiKey = await this.apiKey()
-    const advertised = new Set(request.tools.map((tool) => tool.name))
-    const hostTools = request.tools.filter((tool) => mapCursorTool(tool.name, advertised))
-    const runner = this.ensureWarm()
-    const saved = readCheckpoint(request.sessionKey)
-    const resumeId = resumeAgentId(request.model, request.modelParams, this.sessionAgents.get(request.sessionKey), saved)
-    const promptToSend = resumeId && request.lastUserPrompt ? request.lastUserPrompt : request.prompt
-    const dispatchAt = Date.now()
-
-    if (request.continuation && resumeId && request.toolResults?.length) {
-      for (const result of request.toolResults) {
-        runner.send({ type: "tool_result", id: result.id, content: result.content })
-      }
-    } else {
-      runner.send({
-        type: "turn",
-        apiKey,
-        model: request.model,
-        modelParams: request.modelParams,
-        cwd: request.cwd,
-        stateRoot: sdkStateDir(request.cwd),
-        prompt: promptToSend,
-        tools: hostTools,
-        agentId: resumeId,
-        sessionKey: request.sessionKey,
-      })
-    }
-
-    const onAbort = () => {
-      try {
-        runner.send({ type: "cancel" })
-      } catch {
-        // Ignore.
-      }
-    }
-    request.signal.addEventListener("abort", onAbort, { once: true })
-    let firstTokenAt: number | undefined
+    const requestId = randomUUID()
+    const runner = this.ensureRunner()
+    const deadline = turnStarted + this.turnTimeoutMs
+    log("info", "turn start", { sessionKey: request.sessionKey, model: request.model, requestId })
     try {
-      while (!request.signal.aborted) {
-        const event = await runner.next()
+      const apiKey = await this.apiKey()
+      const advertised = new Set(request.tools.map((tool) => tool.name))
+      const hostTools = request.tools.filter((tool) => mapCursorTool(tool.name, advertised))
+      const saved = readCheckpoint(request.sessionKey)
+      const resumeId = resumeAgentId(request.model, request.modelParams, this.sessionAgents.get(request.sessionKey), saved)
+      const promptToSend = resumeId && request.lastUserPrompt ? request.lastUserPrompt : request.prompt
+      const dispatchAt = Date.now()
+
+      if (request.continuation && resumeId && request.toolResults?.length) {
+        for (const result of request.toolResults) {
+          log("info", "tool result received", { sessionKey: request.sessionKey, model: request.model, toolId: result.id })
+          runner.send({
+            type: "tool_result",
+            id: result.id,
+            content: result.content,
+            sessionKey: request.sessionKey,
+            requestId,
+            model: request.model,
+          })
+        }
+      } else {
+        runner.send({
+          type: "turn",
+          requestId,
+          apiKey,
+          model: request.model,
+          modelParams: request.modelParams,
+          cwd: request.cwd,
+          stateRoot: sdkStateDir(request.cwd),
+          prompt: promptToSend,
+          tools: hostTools,
+          agentId: resumeId,
+          sessionKey: request.sessionKey,
+        })
+      }
+
+      let firstTokenAt: number | undefined
+      let recoveredOrphan = false
+      for (;;) {
+        const event = await this.nextEvent(runner, requestId, request.signal, deadline)
+        if (event === "abort" || event === "idle" || event === "overall") {
+          const reason = event === "abort"
+            ? signalMessage(request.signal)
+            : event === "overall"
+              ? `Cursor turn timed out after ${Math.round(this.turnTimeoutMs / 60000)} minutes`
+              : `No Cursor output for ${Math.round(this.idleTimeoutMs / 1000)} seconds`
+          this.cancelRun(runner, request, requestId, reason)
+          this.logTiming(request, turnStarted, dispatchAt, firstTokenAt, event === "abort" ? "abort" : "timeout")
+          yield { type: "error", message: reason }
+          return
+        }
         if (event.type === "text" && event.text) {
           firstTokenAt ??= Date.now()
           yield { type: "text", text: event.text }
@@ -275,14 +452,36 @@ export class SdkBackend implements CursorBackend {
           this.logTiming(request, turnStarted, dispatchAt, firstTokenAt, "tool")
           return
         } else if (event.type === "error") {
+          if (!recoveredOrphan && event.message === ORPHAN_TOOL_RESULT && request.toolResults?.length) {
+            recoveredOrphan = true
+            log("info", "orphan tool result", {
+              sessionKey: request.sessionKey,
+              model: request.model,
+              reason: "continuing on a new run",
+            })
+            runner.send({
+              type: "turn",
+              requestId,
+              apiKey,
+              model: request.model,
+              modelParams: request.modelParams,
+              cwd: request.cwd,
+              stateRoot: sdkStateDir(request.cwd),
+              prompt: promptWithToolResults(request.prompt, request.toolResults),
+              tools: hostTools,
+              sessionKey: request.sessionKey,
+            })
+            continue
+          }
           this.logTiming(request, turnStarted, dispatchAt, firstTokenAt, "error")
           yield { type: "error", message: event.message || "Cursor SDK failed" }
           return
         } else if (event.type === "done") {
-          if (runner.agentId) {
+          const agentId = event.agentId || this.sessionAgents.get(request.sessionKey)?.agentId
+          if (agentId) {
             const modelKey = modelSelectionKey(request.model, request.modelParams)
-            this.sessionAgents.set(request.sessionKey, { agentId: runner.agentId, modelKey })
-            writeCheckpoint(request.sessionKey, { agentId: runner.agentId, model: modelKey })
+            this.sessionAgents.set(request.sessionKey, { agentId, modelKey })
+            writeCheckpoint(request.sessionKey, { agentId, model: modelKey })
           }
           this.logTiming(request, turnStarted, dispatchAt, firstTokenAt, "done")
           yield { type: "done", text: event.text }
@@ -295,7 +494,7 @@ export class SdkBackend implements CursorBackend {
         }
       }
     } finally {
-      request.signal.removeEventListener("abort", onAbort)
+      runner.discard(requestId)
     }
   }
 
@@ -320,8 +519,8 @@ export class SdkBackend implements CursorBackend {
   }
 
   async dispose(): Promise<void> {
-    this.warm?.cancel()
-    this.warm = undefined
+    this.runner?.kill()
+    this.runner = undefined
     this.sessionAgents.clear()
   }
 }

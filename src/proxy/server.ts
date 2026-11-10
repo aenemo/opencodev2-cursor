@@ -14,6 +14,10 @@ export interface ProxyDeps {
   models: () => Array<Pick<CursorModel, "id">>
   /** Map an OpenCode model id and selected variant to the Cursor id to run. */
   selectModel?: (model: string, variant?: string, cursorModel?: string) => string
+  /** Quiet time between Cursor messages before the turn fails. Default 120 seconds. */
+  idleTimeoutMs?: number
+  /** Longest a single turn may run. Default 15 minutes. */
+  turnTimeoutMs?: number
 }
 
 function header(req: http.IncomingMessage, name: string): string | undefined {
@@ -41,13 +45,62 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   })
 }
 
+const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000
+
+function abortText(signal: AbortSignal): string {
+  const reason = signal.reason
+  if (typeof reason === "string" && reason) return reason
+  if (reason instanceof Error && reason.message) return reason.message
+  return "Client aborted the Cursor turn"
+}
+
+/** Resolves on the next backend event, or as soon as the caller aborts. A silent worker cannot hold the response open. */
+function nextChunk<T>(iterator: AsyncIterator<T>, signal: AbortSignal): Promise<IteratorResult<T> | "abort"> {
+  if (signal.aborted) return Promise.resolve("abort")
+  return new Promise((resolve) => {
+    const onAbort = () => resolve("abort")
+    signal.addEventListener("abort", onAbort, { once: true })
+    iterator.next().then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort)
+        resolve(result)
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort)
+        resolve({ done: true, value: undefined as T })
+        log("warn", "backend stream failed", error instanceof Error ? error.message : error)
+      },
+    )
+  })
+}
+
+async function closeIterator(iterator: AsyncIterator<unknown>): Promise<void> {
+  try {
+    await iterator.return?.()
+  } catch {
+    // The generator may already have finished.
+  }
+}
+
 async function collect(events: AsyncIterable<BackendEvent>, signal: AbortSignal): Promise<BackendEvent[]> {
   const collected: BackendEvent[] = []
-  for await (const event of events) {
-    if (signal.aborted) break
-    collected.push(event)
-    if (event.type === "tool_call" || event.type === "done" || event.type === "error") break
+  const iterator = events[Symbol.asyncIterator]()
+  let aborted = false
+  for (;;) {
+    const next = await nextChunk(iterator, signal)
+    if (next === "abort") {
+      aborted = true
+      collected.push({ type: "error", message: abortText(signal) })
+      break
+    }
+    if (next.done) break
+    collected.push(next.value)
+    if (next.value.type === "tool_call" || next.value.type === "done" || next.value.type === "error") break
   }
+  // The generator is paused on its last yield. Close it so its finally runs. Skip this after
+  // an abort, because the underlying next() may still be pending.
+  if (!aborted) await closeIterator(iterator)
   return collected
 }
 
@@ -88,6 +141,7 @@ async function streamSse(
   events: AsyncIterable<BackendEvent>,
   signal: AbortSignal,
   timing?: { started: number; label: string },
+  onActivity?: () => void,
 ): Promise<void> {
   res.writeHead(200, {
     "content-type": "text/event-stream",
@@ -98,8 +152,18 @@ async function streamSse(
   let started = false
   let toolIndex = 0
   let firstTokenAt: number | undefined
-  for await (const event of events) {
-    if (signal.aborted) break
+  let wroteError = false
+  let aborted = false
+  const iterator = events[Symbol.asyncIterator]()
+  for (;;) {
+    const next = await nextChunk(iterator, signal)
+    if (next === "abort") {
+      aborted = true
+      break
+    }
+    if (next.done) break
+    const event = next.value
+    onActivity?.()
     if (event.type === "text") {
       firstTokenAt ??= Date.now()
       res.write(sse(chunk(model, id, { role: started ? undefined : "assistant", content: event.text }, null)))
@@ -116,11 +180,14 @@ async function streamSse(
       break
     } else if (event.type === "error") {
       res.write(sse({ error: { message: event.message } }))
+      wroteError = true
       break
     } else if (event.type === "done") {
       break
     }
   }
+  if (aborted && !wroteError) res.write(sse({ error: { message: abortText(signal) } }))
+  if (!aborted) await closeIterator(iterator)
   if (timing) {
     log("info", "proxy timing", {
       label: timing.label,
@@ -235,7 +302,23 @@ export function startProxy(depsOrGet: ProxyDeps | (() => ProxyDeps)): Promise<Ru
       const sessionHeader = req.headers["x-opencodev2-cursor-session"]
       const sessionKey = typeof sessionHeader === "string" && sessionHeader ? sessionHeader : "default"
       const controller = new AbortController()
-      req.on("close", () => controller.abort())
+      const idleMs = deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
+      const turnMs = deps.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
+      const abortWith = (message: string) => {
+        if (!controller.signal.aborted) controller.abort(new Error(message))
+      }
+      let idleTimer: NodeJS.Timeout | undefined
+      const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => abortWith(`No Cursor output for ${Math.round(idleMs / 1000)} seconds`), idleMs)
+      }
+      armIdle()
+      const turnTimer = setTimeout(() => abortWith(`Cursor turn timed out after ${Math.round(turnMs / 60000)} minutes`), turnMs)
+      const onClientGone = () => {
+        if (!res.writableEnded) abortWith("Client aborted the Cursor turn")
+      }
+      res.on("close", onClientGone)
+      req.on("aborted", () => abortWith("Client aborted the Cursor turn"))
       const stream = backend.run({
         model: resolved.cursorId,
         modelParams: resolved.params,
@@ -249,19 +332,25 @@ export function startProxy(depsOrGet: ProxyDeps | (() => ProxyDeps)): Promise<Ru
         sessionKey,
         signal: controller.signal,
       })
-      if (body.stream === false) {
-        const events = await collect(stream, controller.signal)
-        log("info", "proxy timing", {
-          label: "chat-json",
-          model: resolved.cliModel,
-          totalMs: Date.now() - requestStarted,
-        })
-        writeJson(res, model, id, events)
-      } else {
-        await streamSse(res, model, id, stream, controller.signal, {
-          started: requestStarted,
-          label: "chat",
-        })
+      try {
+        if (body.stream === false) {
+          const events = await collect(stream, controller.signal)
+          log("info", "proxy timing", {
+            label: "chat-json",
+            model: resolved.cliModel,
+            totalMs: Date.now() - requestStarted,
+          })
+          writeJson(res, model, id, events)
+        } else {
+          await streamSse(res, model, id, stream, controller.signal, {
+            started: requestStarted,
+            label: "chat",
+          }, armIdle)
+        }
+      } finally {
+        if (idleTimer) clearTimeout(idleTimer)
+        clearTimeout(turnTimer)
+        res.removeListener("close", onClientGone)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Cursor request failed"

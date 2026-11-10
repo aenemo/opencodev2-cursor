@@ -2,6 +2,7 @@ import path from "node:path"
 import readline from "node:readline"
 import { randomUUID } from "node:crypto"
 import { Agent, Cursor, JsonlLocalAgentStore, configureCursorSdk, createAgentPlatform } from "@cursor/sdk"
+import { createSessionHub } from "./sdk-sessions.mjs"
 
 const major = Number(process.versions.node.split(".")[0] ?? 0)
 const minor = Number(process.versions.node.split(".")[1] ?? 0)
@@ -13,14 +14,7 @@ if (major < 22 || (major === 22 && minor < 13)) {
 /** Long-lived hosts: avoid re-walking the tree every 20s (SDK default). Override with CURSOR_RIPWALK_CACHE_TTL_MS. */
 const WORKSPACE_SCAN_TTL_MS = Number(process.env.CURSOR_RIPWALK_CACHE_TTL_MS || 30 * 60 * 1000)
 
-const waiters = new Map()
-let agent = null
-let activeModel = null
-let activeSession = null
-let runHandle = null
-let busy = false
-/** Bumped when a run is force-cleared so a superseded turn's finally does not clear the new turn's busy flag. */
-let turnGeneration = 0
+const hub = createSessionHub()
 let store = null
 let storeRoot = null
 let platform = null
@@ -32,7 +26,11 @@ function emit(message) {
   process.stdout.write(JSON.stringify(message) + "\n")
 }
 
-function customTools(tools) {
+function diag(event, fields) {
+  emit({ type: "diag", event, ...fields })
+}
+
+function customTools(tools, session) {
   const defined = {}
   for (const tool of tools ?? []) {
     defined[tool.name] = {
@@ -40,9 +38,9 @@ function customTools(tools) {
       inputSchema: tool.parameters && typeof tool.parameters === "object" ? tool.parameters : { type: "object", additionalProperties: true },
       execute(_args, context) {
         const id = context?.toolCallId || randomUUID()
-        emit({ type: "tool", id, name: tool.name, arguments: JSON.stringify(_args ?? {}) })
+        emit({ type: "tool", id, name: tool.name, arguments: JSON.stringify(_args ?? {}), sessionKey: session.sessionKey, requestId: session.requestId })
         return new Promise((resolve) => {
-          waiters.set(id, resolve)
+          session.waiters.set(id, resolve)
         })
       },
     }
@@ -56,22 +54,6 @@ function modelKey(cmd) {
     ? cmd.modelParams.map((param) => ({ id: String(param.id), value: String(param.value) })).sort((left, right) => left.id.localeCompare(right.id))
     : []
   return JSON.stringify({ id: cmd.model || "auto-smart", params })
-}
-
-async function clearStuckRun() {
-  turnGeneration += 1
-  const pending = runHandle
-  runHandle = null
-  for (const [, resolve] of waiters) resolve("(cancelled)")
-  waiters.clear()
-  if (pending) {
-    try {
-      await pending.cancel()
-    } catch {
-      // Already terminal or store already marked cancelled.
-    }
-  }
-  busy = false
 }
 
 function ensureStore(stateRoot) {
@@ -132,20 +114,18 @@ async function ensurePrewarm(cmd) {
   }
 }
 
-async function ensureAgent(cmd) {
+async function ensureAgent(cmd, session) {
   const requestedModel = modelKey(cmd)
-  const sessionKey = cmd.sessionKey || "default"
   if (
-    agent
-    && activeModel === requestedModel
-    && activeSession === sessionKey
-    && (!cmd.agentId || agent.agentId === cmd.agentId)
+    session.agent
+    && session.modelKey === requestedModel
+    && (!cmd.agentId || session.agent.agentId === cmd.agentId)
   ) {
-    return agent
+    return session.agent
   }
   ensureStore(cmd.stateRoot)
   await ensurePrewarm(cmd)
-  const tools = customTools(cmd.tools)
+  const tools = customTools(cmd.tools, session)
   const model = { id: cmd.model || "auto-smart" }
   if (Array.isArray(cmd.modelParams) && cmd.modelParams.length) model.params = cmd.modelParams
   const options = {
@@ -159,90 +139,104 @@ async function ensureAgent(cmd) {
     options.disallowedTools = ["shell", "read", "edit", "grep", "glob", "delete", "task"]
   }
   // Resume only when the parent sends an agentId. A model change omits it, so this creates a new agent.
-  agent = cmd.agentId ? await Agent.resume(cmd.agentId, options) : await Agent.create(options)
-  activeModel = requestedModel
-  activeSession = sessionKey
-  emit({ type: "session", agentId: agent.agentId })
-  return agent
+  session.agent = cmd.agentId ? await Agent.resume(cmd.agentId, options) : await Agent.create(options)
+  session.modelKey = requestedModel
+  emit({ type: "session", agentId: session.agent.agentId, sessionKey: session.sessionKey, requestId: session.requestId })
+  return session.agent
 }
 
-async function startRun(current, prompt) {
-  // local.force expires orphaned activeRunId left by abort/crash/retry (Cursor SDK docs).
+async function startRun(session, prompt) {
+  // local.force expires an orphaned active run on this agent only.
   try {
-    return await current.send(prompt, { local: { force: true } })
+    return await session.agent.send(prompt, { local: { force: true } })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (!/already has active run/i.test(message)) throw error
-    const pending = runHandle
-    runHandle = null
-    for (const [, resolve] of waiters) resolve("(cancelled)")
-    waiters.clear()
+    const pending = session.run
+    session.run = null
+    for (const resolve of session.waiters.values()) resolve("(cancelled)")
+    session.waiters.clear()
     if (pending) {
       try {
         await pending.cancel()
       } catch {
-        // Ignore.
+        // Already finished.
       }
     }
-    return current.send(prompt, { local: { force: true } })
+    return session.agent.send(prompt, { local: { force: true } })
   }
 }
 
+function finalError(session, requestId, message) {
+  emit({
+    type: "error",
+    message,
+    sessionKey: session?.sessionKey,
+    requestId: requestId || session?.requestId,
+  })
+}
+
 async function runTurn(cmd) {
-  const toolContinue = (cmd.toolResults ?? []).length > 0
-  if (toolContinue) {
-    // Tool results are normally delivered as type=tool_result; keep this path from clearing busy.
-    for (const result of cmd.toolResults ?? []) {
-      const resolve = waiters.get(result.id)
-      if (resolve) {
-        waiters.delete(result.id)
-        resolve(result.content ?? "")
-      }
+  const session = hub.ensure(cmd.sessionKey)
+  if ((cmd.toolResults ?? []).length > 0) {
+    let missing = false
+    for (const result of cmd.toolResults) {
+      const delivered = hub.toolResult({ ...cmd, id: result.id, content: result.content })
+      if (delivered.ok) diag("tool result received", { sessionKey: session.sessionKey, model: cmd.model, toolId: result.id })
+      else missing = true
+    }
+    if (missing) {
+      diag("orphan tool result", { sessionKey: session.sessionKey, model: cmd.model, reason: "turn toolResults" })
+      finalError(session, cmd.requestId, "Tool result arrived after the Cursor run ended")
     }
     return
   }
-  if (busy) {
-    // OpenCode retried or sent a new user message while a previous run was wedged.
-    await clearStuckRun()
+  if (session.busy || session.run) {
+    const previousId = session.requestId
+    await hub.clear(session, "new turn")
+    diag("run cancelled", { sessionKey: session.sessionKey, model: cmd.model, reason: "new turn" })
+    finalError(session, previousId, "Cursor run was replaced by a new turn")
   }
-  const myGeneration = turnGeneration + 1
-  turnGeneration = myGeneration
-  busy = true
+  session.busy = true
+  session.requestId = cmd.requestId
+  const generation = session.generation
+  diag("turn start", { sessionKey: session.sessionKey, model: cmd.model, requestId: cmd.requestId })
   try {
-    const current = await ensureAgent(cmd)
-    const run = await startRun(current, cmd.prompt || "")
-    if (myGeneration !== turnGeneration) return
-    runHandle = run
+    const current = await ensureAgent(cmd, session)
+    if (session.generation !== generation) return
+    const run = await startRun(session, cmd.prompt || "")
+    if (session.generation !== generation) return
+    session.run = run
     let sent = ""
     for await (const event of run.stream()) {
-      if (myGeneration !== turnGeneration) return
+      if (session.generation !== generation) return
       if (event.type === "assistant") {
         const blocks = event.message?.content ?? []
         for (const block of blocks) {
           if (block.type !== "text" || typeof block.text !== "string") continue
           const text = block.text.startsWith(sent) ? block.text.slice(sent.length) : block.text
           sent = block.text.startsWith(sent) ? block.text : sent + block.text
-          if (text) emit({ type: "text", text })
+          if (text) emit({ type: "text", text, sessionKey: session.sessionKey, requestId: session.requestId })
         }
       } else if (event.type === "thinking" && event.text) {
-        emit({ type: "reasoning", text: event.text })
-      } else if (event.type === "status" && (event.status === "ERROR" || event.status === "CANCELLED")) {
-        emit({ type: "error", message: event.message || event.status })
+        emit({ type: "reasoning", text: event.text, sessionKey: session.sessionKey, requestId: session.requestId })
       }
     }
+    if (session.generation !== generation) return
     const result = await run.wait()
-    if (myGeneration !== turnGeneration) return
-    runHandle = null
-    if (result.status === "error") emit({ type: "error", message: result.error?.message || "Cursor run failed" })
-    else emit({ type: "done", text: result.result })
+    if (session.generation !== generation) return
+    session.run = null
+    if (result.status === "error") finalError(session, session.requestId, result.error?.message || "Cursor run failed")
+    else emit({ type: "done", text: result.result, sessionKey: session.sessionKey, requestId: session.requestId })
   } catch (error) {
-    if (myGeneration === turnGeneration) {
-      emit({ type: "error", message: error instanceof Error ? error.message : String(error) })
+    if (session.generation === generation) {
+      finalError(session, session.requestId, error instanceof Error ? error.message : String(error))
     }
   } finally {
-    if (myGeneration === turnGeneration) {
-      busy = false
-      emit({ type: "idle" })
+    if (session.generation === generation) {
+      session.busy = false
+      session.run = null
+      emit({ type: "idle", sessionKey: session.sessionKey, requestId: session.requestId })
     }
   }
 }
@@ -275,9 +269,7 @@ async function listModels(cmd) {
 async function warm(cmd) {
   const started = Date.now()
   try {
-    const modelsPromise = Cursor.models.list({ apiKey: cmd.apiKey }).catch((error) => {
-      throw error
-    })
+    const modelsPromise = Cursor.models.list({ apiKey: cmd.apiKey })
     await ensurePrewarm(cmd)
     const models = await modelsPromise
     emit({
@@ -293,6 +285,26 @@ async function warm(cmd) {
   }
 }
 
+async function prewarm(cmd) {
+  try {
+    await ensurePrewarm(cmd)
+    emit({ type: "warm", id: cmd.id, cwd: cmd.cwd, prewarmed: Boolean(prewarmRelease), models: [] })
+  } catch (error) {
+    emit({ type: "error", id: cmd.id, message: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+function replyToMissing(cmd, message) {
+  // The parent treats this exact message as "start a fresh turn", so the wording is part of the protocol.
+  diag("orphan tool result", { sessionKey: cmd.sessionKey || "default", model: cmd.model, toolId: cmd.id, reason: "no run" })
+  emit({
+    type: "error",
+    message,
+    sessionKey: cmd.sessionKey || "default",
+    requestId: cmd.requestId,
+  })
+}
+
 const lines = readline.createInterface({ input: process.stdin })
 lines.on("line", (line) => {
   let cmd
@@ -302,15 +314,25 @@ lines.on("line", (line) => {
     return
   }
   if (cmd.type === "tool_result") {
-    const resolve = waiters.get(cmd.id)
-    if (resolve) {
-      waiters.delete(cmd.id)
-      resolve(cmd.content ?? "")
+    const delivered = hub.toolResult(cmd)
+    if (delivered.ok) {
+      diag("tool result received", { sessionKey: delivered.sessionKey, model: cmd.model, toolId: cmd.id })
+      return
     }
+    replyToMissing(cmd, delivered.message)
     return
   }
   if (cmd.type === "cancel") {
-    void clearStuckRun()
+    void hub.cancel(cmd.sessionKey, cmd.reason).then((result) => {
+      const sessionKey = cmd.sessionKey || result.sessionKey
+      diag("run cancelled", { sessionKey, model: cmd.model, reason: cmd.reason || "cancel" })
+      emit({
+        type: "error",
+        message: "Cursor run was cancelled",
+        sessionKey,
+        requestId: cmd.requestId || result.requestId,
+      })
+    })
     return
   }
   if (cmd.type === "ping") {
@@ -323,6 +345,10 @@ lines.on("line", (line) => {
   }
   if (cmd.type === "warm") {
     void warm(cmd)
+    return
+  }
+  if (cmd.type === "prewarm") {
+    void prewarm(cmd)
     return
   }
   if (cmd.type === "turn") void runTurn(cmd)
