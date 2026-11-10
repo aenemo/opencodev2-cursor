@@ -1,6 +1,6 @@
 {
   "name": "opencodev2-cursor",
-  "version": "0.1.4",
+  "version": "0.1.7",
   "description": "OpenCode V2 plugin that uses a Cursor subscription from OpenChamber and other OpenCode hosts.",
   "license": "MIT",
   "repository": {

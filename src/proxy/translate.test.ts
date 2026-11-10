@@ -321,6 +321,120 @@ describe("proxy auth", () => {
       await proxy.close()
     }
   })
+
+  it("ends a silent stream with an error and [DONE], and releases the turn", async () => {
+    let calls = 0
+    let held = false
+    const backend = {
+      id: "cli" as const,
+      async listModels() {
+        return []
+      },
+      async *run(request: { signal: AbortSignal }) {
+        calls += 1
+        if (calls > 1) {
+          yield { type: "text" as const, text: "next" }
+          yield { type: "done" as const }
+          return
+        }
+        held = true
+        await new Promise<void>((resolve) => {
+          if (request.signal.aborted) resolve()
+          else request.signal.addEventListener("abort", () => resolve(), { once: true })
+        })
+        held = false
+      },
+    }
+    const proxy = await startProxy({
+      getAuth: async () => ({ kind: "cli" }),
+      backends: { cli: backend, sdk: backend, native: backend },
+      fallbackDirectory: () => process.cwd(),
+      models: () => [],
+      idleTimeoutMs: 40,
+      turnTimeoutMs: 5_000,
+    })
+    try {
+      const first = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.7", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      })
+      const body = await first.text()
+      expect(body).toContain("No Cursor output")
+      expect(body).toContain("data: [DONE]")
+      expect(held).toBe(false)
+      const second = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.7", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      })
+      const follow = await second.text()
+      expect(follow).toContain("next")
+      expect(follow).toContain("data: [DONE]")
+    } finally {
+      await proxy.close()
+    }
+  })
+
+  it("releases a silent turn when the client aborts", async () => {
+    let calls = 0
+    let released = false
+    const backend = {
+      id: "cli" as const,
+      async listModels() {
+        return []
+      },
+      async *run(request: { signal: AbortSignal }) {
+        calls += 1
+        if (calls > 1) {
+          yield { type: "text" as const, text: "next" }
+          yield { type: "done" as const }
+          return
+        }
+        request.signal.addEventListener("abort", () => {
+          released = true
+        }, { once: true })
+        await new Promise<void>((resolve) => {
+          if (request.signal.aborted) resolve()
+          else request.signal.addEventListener("abort", () => resolve(), { once: true })
+        })
+      },
+    }
+    const proxy = await startProxy({
+      getAuth: async () => ({ kind: "cli" }),
+      backends: { cli: backend, sdk: backend, native: backend },
+      fallbackDirectory: () => process.cwd(),
+      models: () => [],
+      idleTimeoutMs: 30_000,
+      turnTimeoutMs: 60_000,
+    })
+    try {
+      const abort = new AbortController()
+      const pending = fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.7", stream: true, messages: [{ role: "user", content: "hi" }] }),
+        signal: abort.signal,
+      })
+      const response = await pending
+      const reader = response.body!.getReader()
+      const reading = reader.read()
+      abort.abort()
+      await reading.catch(() => undefined)
+      const deadline = Date.now() + 1_000
+      while (!released && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(released).toBe(true)
+      const second = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.7", stream: false, messages: [{ role: "user", content: "hi" }] }),
+      })
+      const json = await second.json() as { choices: Array<{ message: { content: string } }> }
+      expect(json.choices[0]?.message.content).toBe("next")
+    } finally {
+      await proxy.close()
+    }
+  })
 })
 
 describe("shared proxy", () => {

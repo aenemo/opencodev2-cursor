@@ -3,7 +3,7 @@ import { createInterface } from "node:readline"
 import { fileURLToPath } from "node:url"
 import type { BackendEvent, BackendRunRequest, CursorBackend } from "../types.js"
 import { promptWithToolResults } from "../types.js"
-import { SdkBackend } from "../sdk.js"
+import { SdkBackend, type SdkBackendOptions } from "../sdk.js"
 import { encodeConnectFrames, encodeRunRequest, decodeConnectData, stringsInProtobuf, toolCallFromText } from "./proto.js"
 import { nodeBinary } from "../spawn.js"
 import { mapCursorTool } from "../../proxy/tools.js"
@@ -83,8 +83,8 @@ export class NativeBackend implements CursorBackend {
   readonly id = "native" as const
   private readonly sdk: SdkBackend
 
-  constructor(private readonly accessToken: () => Promise<string>) {
-    this.sdk = new SdkBackend(accessToken)
+  constructor(private readonly accessToken: () => Promise<string>, options?: SdkBackendOptions) {
+    this.sdk = new SdkBackend(accessToken, options)
   }
 
   listModels() {
