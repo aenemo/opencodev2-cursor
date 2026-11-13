@@ -1,4 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
+import fs from "node:fs"
+import net from "node:net"
+import path from "node:path"
+import { spawn } from "node:child_process"
 import { createInterface } from "node:readline"
 import { randomUUID } from "node:crypto"
 import { fileURLToPath } from "node:url"
@@ -7,7 +10,7 @@ import { FALLBACK_MODELS, MODEL_CONTEXT_WINDOW, MODEL_MAX_TOKENS, promptWithTool
 import { expandSdkModels, type SdkListedModel } from "./sdk-models.js"
 import { assertNodeForSdk, nodeBinary } from "./spawn.js"
 import { modelSelectionKey } from "./auto-models.js"
-import { compileCacheDir, sdkStateDir } from "../util/paths.js"
+import { cacheDir, compileCacheDir, sdkStateDir } from "../util/paths.js"
 import { readCheckpoint, writeCheckpoint } from "./checkpoint.js"
 import { log } from "../util/log.js"
 import { mapCursorTool } from "../proxy/tools.js"
@@ -55,13 +58,13 @@ class SdkRunner implements RunnerTransport {
   private lanes = new Map<string, Lane>()
   private closed = new Set<string>()
   private dead: RunnerEvent | undefined
-  private child: ChildProcessWithoutNullStreams
+  private socket: net.Socket
   agentId: string | undefined
   alive = true
 
-  constructor(child: ChildProcessWithoutNullStreams) {
-    this.child = child
-    const lines = createInterface({ input: child.stdout })
+  constructor(socket: net.Socket) {
+    this.socket = socket
+    const lines = createInterface({ input: socket })
     lines.on("line", (line) => {
       let event: RunnerEvent
       try {
@@ -83,8 +86,9 @@ class SdkRunner implements RunnerTransport {
       if (event.type === "idle" || event.type === "pong" || event.type === "warn") return
       this.deliver(event)
     })
-    child.on("exit", (code) => {
-      this.failAll(`Cursor SDK runner exited (${code ?? "signal"})`)
+    socket.on("error", () => socket.destroy())
+    socket.on("close", () => {
+      this.failAll("Cursor SDK runner exited (closed)")
     })
   }
 
@@ -125,7 +129,7 @@ class SdkRunner implements RunnerTransport {
   }
 
   send(message: unknown): void {
-    this.child.stdin.write(JSON.stringify(message) + "\n")
+    this.socket.write(JSON.stringify(message) + "\n")
   }
 
   next(laneKey: string): Promise<RunnerEvent> {
@@ -144,9 +148,9 @@ class SdkRunner implements RunnerTransport {
   kill(): void {
     this.alive = false
     try {
-      this.child.kill()
+      this.socket.end()
     } catch {
-      // Process may already be gone.
+      // The socket may already be gone.
     }
   }
 }
@@ -165,18 +169,75 @@ function runnerScript(): string {
   return fileURLToPath(new URL("./sdk-runner.mjs", import.meta.url))
 }
 
-function startRunner(): RunnerTransport {
-  if (!process.env.CURSOR_ACP_NODE_BIN) assertNodeForSdk()
-  const child = spawn(nodeBinary(), [runnerScript()], {
-    stdio: ["pipe", "pipe", "pipe"],
+function brokerScript(): string {
+  return fileURLToPath(new URL("./sdk-broker.mjs", import.meta.url))
+}
+
+function readBrokerInfo(): { port: number; pid: number } | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(cacheDir(), "sdk-broker.json"), "utf8")) as { port?: number; pid?: number }
+    if (!parsed.port || !parsed.pid) return undefined
+    return { port: parsed.port, pid: parsed.pid }
+  } catch {
+    return undefined
+  }
+}
+
+function probe(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect(port, "127.0.0.1")
+    const finish = (open: boolean) => {
+      socket.destroy()
+      resolve(open)
+    }
+    socket.once("connect", () => finish(true))
+    socket.once("error", () => finish(false))
+  })
+}
+
+let brokerSpawned = false
+
+function spawnBroker(): void {
+  if (brokerSpawned) return
+  brokerSpawned = true
+  const child = spawn(nodeBinary(), [brokerScript(), cacheDir(), runnerScript()], {
     windowsHide: true,
-    env: {
-      ...process.env,
-      NODE_COMPILE_CACHE: compileCacheDir(),
-    },
-  }) as ChildProcessWithoutNullStreams
-  child.stderr.on("data", (chunk) => log("warn", "sdk runner", chunk.toString().trim()))
-  return new SdkRunner(child)
+    stdio: "ignore",
+    env: { ...process.env, NODE_COMPILE_CACHE: compileCacheDir() },
+  })
+  child.on("exit", () => {
+    brokerSpawned = false
+  })
+}
+
+function socketReady(socket: net.Socket): Promise<void> {
+  return new Promise((resolve, reject) => {
+    socket.once("connect", () => resolve())
+    socket.once("error", reject)
+  })
+}
+
+async function connectSharedRunner(): Promise<RunnerTransport> {
+  if (!process.env.CURSOR_ACP_NODE_BIN) assertNodeForSdk()
+  fs.mkdirSync(cacheDir(), { recursive: true })
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const info = readBrokerInfo()
+    if (info && await probe(info.port)) {
+      const socket = net.connect(info.port, "127.0.0.1")
+      socket.setNoDelay(true)
+      try {
+        await socketReady(socket)
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        continue
+      }
+      log("info", "sdk worker connected", { pid: info.pid })
+      return new SdkRunner(socket)
+    }
+    spawnBroker()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error("Cursor SDK worker did not start")
 }
 
 function signalMessage(signal: AbortSignal): string {
@@ -199,8 +260,8 @@ export interface SdkBackendOptions {
   idleTimeoutMs?: number
   turnTimeoutMs?: number
   modelsCacheTtlMs?: number
-  /** Test hook. The default spawns the long-lived SDK worker. */
-  connect?: () => RunnerTransport
+  /** Test hook. The default connects to the shared SDK worker. */
+  connect?: () => RunnerTransport | Promise<RunnerTransport>
 }
 
 /** Resume only when the stored agent was created for this model and its params. */
@@ -221,33 +282,42 @@ export function resumeAgentId(
 }
 
 /**
- * One long-lived Node worker, with a separate agent, run, and lock per OpenCode session.
+ * One shared SDK worker for every project on this machine, with a separate agent, run, and lock per OpenCode session.
  * A turn in one session cannot cancel a run that another session has paused on a tool call.
  */
 export class SdkBackend implements CursorBackend {
   readonly id = "sdk" as const
   private runner: RunnerTransport | undefined
+  private connecting: Promise<RunnerTransport> | undefined
   private sessionAgents = new Map<string, RememberedAgent>()
   private sessionLocks = new Map<string, Promise<void>>()
   private prewarms = new Map<string, Promise<void>>()
   private readonly models: ModelCache
-  private readonly connect: () => RunnerTransport
+  private readonly connect: () => RunnerTransport | Promise<RunnerTransport>
   private readonly idleTimeoutMs: number
   private readonly turnTimeoutMs: number
 
   constructor(private readonly apiKey: () => Promise<string>, options?: SdkBackendOptions) {
-    this.connect = options?.connect ?? startRunner
+    this.connect = options?.connect ?? connectSharedRunner
     this.idleTimeoutMs = options?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
     this.turnTimeoutMs = options?.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
     this.models = createModelCache({ ttlMs: options?.modelsCacheTtlMs })
   }
 
-  private ensureRunner(): RunnerTransport {
+  private async ensureRunner(): Promise<RunnerTransport> {
     if (this.runner?.alive) return this.runner
-    this.prewarms.clear()
-    this.runner = this.connect()
-    log("info", "sdk worker started")
-    return this.runner
+    if (!this.connecting) {
+      this.prewarms.clear()
+      this.connecting = Promise.resolve().then(() => this.connect()).then((runner) => {
+        this.runner = runner
+        return runner
+      })
+    }
+    try {
+      return await this.connecting
+    } finally {
+      this.connecting = undefined
+    }
   }
 
   private async prewarm(cwd: string): Promise<void> {
@@ -265,7 +335,7 @@ export class SdkBackend implements CursorBackend {
 
   private async sendPrewarm(cwd: string): Promise<void> {
     const apiKey = await this.apiKey()
-    const runner = this.ensureRunner()
+    const runner = await this.ensureRunner()
     const id = `prewarm:${randomUUID()}`
     runner.send({ type: "prewarm", id, apiKey, cwd, stateRoot: sdkStateDir(cwd) })
     const event = await runner.next(id)
@@ -275,7 +345,7 @@ export class SdkBackend implements CursorBackend {
 
   private async requestModels(cwd: string): Promise<CursorModel[]> {
     const apiKey = await this.apiKey()
-    const runner = this.ensureRunner()
+    const runner = await this.ensureRunner()
     const id = `models:${randomUUID()}`
     runner.send({ type: "models", id, apiKey, cwd, stateRoot: cwd ? sdkStateDir(cwd) : undefined })
     const event = await runner.next(id)
@@ -312,12 +382,15 @@ export class SdkBackend implements CursorBackend {
       released = true
       release()
     }
+    let onQueuedAbort: (() => void) | undefined
     try {
       if (request.signal.aborted) return
       const aborted = new Promise<"abort">((resolve) => {
-        request.signal.addEventListener("abort", () => resolve("abort"), { once: true })
+        onQueuedAbort = () => resolve("abort")
+        request.signal.addEventListener("abort", onQueuedAbort, { once: true })
       })
       const waited = await Promise.race([previous.then(() => "ready" as const), aborted])
+      request.signal.removeEventListener("abort", onQueuedAbort!)
       if (waited === "abort" || request.signal.aborted) {
         log("info", "client abort", {
           sessionKey: request.sessionKey,
@@ -334,6 +407,7 @@ export class SdkBackend implements CursorBackend {
         yield event
       }
     } finally {
+      if (onQueuedAbort) request.signal.removeEventListener("abort", onQueuedAbort)
       releaseOnce()
     }
   }
@@ -353,13 +427,16 @@ export class SdkBackend implements CursorBackend {
     const timeout = new Promise<"idle" | "overall">((resolve) => {
       timer = setTimeout(() => resolve(idleLimited ? "idle" : "overall"), waitMs)
     })
+    let onAbort!: () => void
     const aborted = new Promise<"abort">((resolve) => {
-      signal.addEventListener("abort", () => resolve("abort"), { once: true })
+      onAbort = () => resolve("abort")
+      signal.addEventListener("abort", onAbort, { once: true })
     })
     try {
       return await Promise.race([runner.next(lane), timeout, aborted])
     } finally {
       if (timer) clearTimeout(timer)
+      signal.removeEventListener("abort", onAbort)
     }
   }
 
@@ -379,10 +456,11 @@ export class SdkBackend implements CursorBackend {
 
   private async *runLocked(request: BackendRunRequest, turnStarted: number): AsyncIterable<BackendEvent> {
     const requestId = randomUUID()
-    const runner = this.ensureRunner()
     const deadline = turnStarted + this.turnTimeoutMs
     log("info", "turn start", { sessionKey: request.sessionKey, model: request.model, requestId })
+    let runner: RunnerTransport | undefined
     try {
+      runner = await this.ensureRunner()
       const apiKey = await this.apiKey()
       const advertised = new Set(request.tools.map((tool) => tool.name))
       const hostTools = request.tools.filter((tool) => mapCursorTool(tool.name, advertised))
@@ -416,6 +494,7 @@ export class SdkBackend implements CursorBackend {
           tools: hostTools,
           agentId: resumeId,
           sessionKey: request.sessionKey,
+          idleTimeoutMs: this.idleTimeoutMs,
         })
       }
 
@@ -470,12 +549,15 @@ export class SdkBackend implements CursorBackend {
               prompt: promptWithToolResults(request.prompt, request.toolResults),
               tools: hostTools,
               sessionKey: request.sessionKey,
+              idleTimeoutMs: this.idleTimeoutMs,
             })
             continue
           }
           this.logTiming(request, turnStarted, dispatchAt, firstTokenAt, "error")
           yield { type: "error", message: event.message || "Cursor SDK failed" }
           return
+        } else if (event.type === "keepalive") {
+          yield { type: "keepalive" }
         } else if (event.type === "done") {
           const agentId = event.agentId || this.sessionAgents.get(request.sessionKey)?.agentId
           if (agentId) {
@@ -494,7 +576,7 @@ export class SdkBackend implements CursorBackend {
         }
       }
     } finally {
-      runner.discard(requestId)
+      runner?.discard(requestId)
     }
   }
 

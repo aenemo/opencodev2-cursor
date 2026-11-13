@@ -26,6 +26,13 @@ function emit(message) {
   process.stdout.write(JSON.stringify(message) + "\n")
 }
 
+/** Shorter than the idle timeout, and at most 15 seconds. A silent live run must report in before the proxy gives up. */
+function pulseEvery(idleTimeoutMs) {
+  const idle = Number(idleTimeoutMs)
+  const windowMs = Number.isFinite(idle) && idle > 0 ? idle : 300000
+  return Math.min(15_000, Math.max(50, Math.floor(windowMs / 3)))
+}
+
 function diag(event, fields) {
   emit({ type: "diag", event, ...fields })
 }
@@ -195,11 +202,12 @@ async function runTurn(cmd) {
     const previousId = session.requestId
     await hub.clear(session, "new turn")
     diag("run cancelled", { sessionKey: session.sessionKey, model: cmd.model, reason: "new turn" })
-    finalError(session, previousId, "Cursor run was replaced by a new turn")
+    emit({ type: "done", text: "", sessionKey: session.sessionKey, requestId: previousId })
   }
   session.busy = true
   session.requestId = cmd.requestId
   const generation = session.generation
+  let pulse
   diag("turn start", { sessionKey: session.sessionKey, model: cmd.model, requestId: cmd.requestId })
   try {
     const current = await ensureAgent(cmd, session)
@@ -207,6 +215,11 @@ async function runTurn(cmd) {
     const run = await startRun(session, cmd.prompt || "")
     if (session.generation !== generation) return
     session.run = run
+    pulse = setInterval(() => {
+      if (session.generation !== generation) return
+      emit({ type: "keepalive", sessionKey: session.sessionKey, requestId: session.requestId })
+    }, pulseEvery(cmd.idleTimeoutMs))
+    pulse.unref()
     let sent = ""
     for await (const event of run.stream()) {
       if (session.generation !== generation) return
@@ -233,6 +246,7 @@ async function runTurn(cmd) {
       finalError(session, session.requestId, error instanceof Error ? error.message : String(error))
     }
   } finally {
+    if (pulse) clearInterval(pulse)
     if (session.generation === generation) {
       session.busy = false
       session.run = null
@@ -253,9 +267,21 @@ function listedModel(model) {
   }
 }
 
+const modelFlights = new Map()
+
+function modelsFor(apiKey) {
+  let flight = modelFlights.get(apiKey)
+  if (flight) return flight
+  flight = Cursor.models.list({ apiKey }).finally(() => {
+    if (modelFlights.get(apiKey) === flight) modelFlights.delete(apiKey)
+  })
+  modelFlights.set(apiKey, flight)
+  return flight
+}
+
 async function listModels(cmd) {
   try {
-    const models = await Cursor.models.list({ apiKey: cmd.apiKey })
+    const models = await modelsFor(cmd.apiKey)
     emit({
       type: "models",
       id: cmd.id,
@@ -269,7 +295,7 @@ async function listModels(cmd) {
 async function warm(cmd) {
   const started = Date.now()
   try {
-    const modelsPromise = Cursor.models.list({ apiKey: cmd.apiKey })
+    const modelsPromise = modelsFor(cmd.apiKey)
     await ensurePrewarm(cmd)
     const models = await modelsPromise
     emit({

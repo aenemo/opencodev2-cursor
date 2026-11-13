@@ -14,7 +14,7 @@ export interface ProxyDeps {
   models: () => Array<Pick<CursorModel, "id">>
   /** Map an OpenCode model id and selected variant to the Cursor id to run. */
   selectModel?: (model: string, variant?: string, cursorModel?: string) => string
-  /** Quiet time between Cursor messages before the turn fails. Default 120 seconds. */
+  /** Quiet time with no sign the run is still going, before the turn fails. Default 5 minutes. A live SDK run reports in, so model silence waits for the turn cap. */
   idleTimeoutMs?: number
   /** Longest a single turn may run. Default 15 minutes. */
   turnTimeoutMs?: number
@@ -83,7 +83,7 @@ async function closeIterator(iterator: AsyncIterator<unknown>): Promise<void> {
   }
 }
 
-async function collect(events: AsyncIterable<BackendEvent>, signal: AbortSignal): Promise<BackendEvent[]> {
+async function collect(events: AsyncIterable<BackendEvent>, signal: AbortSignal, onActivity?: () => void): Promise<BackendEvent[]> {
   const collected: BackendEvent[] = []
   const iterator = events[Symbol.asyncIterator]()
   let aborted = false
@@ -96,6 +96,7 @@ async function collect(events: AsyncIterable<BackendEvent>, signal: AbortSignal)
     }
     if (next.done) break
     collected.push(next.value)
+    onActivity?.()
     if (next.value.type === "tool_call" || next.value.type === "done" || next.value.type === "error") break
   }
   // The generator is paused on its last yield. Close it so its finally runs. Skip this after
@@ -178,6 +179,8 @@ async function streamSse(
       }, null)))
       toolIndex += 1
       break
+    } else if (event.type === "keepalive") {
+      // Activity only. The Cursor run is still open, and this is not model output.
     } else if (event.type === "error") {
       res.write(sse({ error: { message: event.message } }))
       wroteError = true
@@ -334,7 +337,7 @@ export function startProxy(depsOrGet: ProxyDeps | (() => ProxyDeps)): Promise<Ru
       })
       try {
         if (body.stream === false) {
-          const events = await collect(stream, controller.signal)
+          const events = await collect(stream, controller.signal, armIdle)
           log("info", "proxy timing", {
             label: "chat-json",
             model: resolved.cliModel,

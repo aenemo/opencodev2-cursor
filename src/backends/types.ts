@@ -13,6 +13,8 @@ export type BackendEvent =
   | { type: "tool_call"; id: string; name: string; arguments: string }
   | { type: "done"; text?: string }
   | { type: "error"; message: string }
+  /** The Cursor run is still open, but it has not produced model output. Not shown to the user. */
+  | { type: "keepalive" }
 
 export interface ToolSpec {
   name: string

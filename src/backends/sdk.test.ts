@@ -1,9 +1,11 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { getEventListeners } from "node:events"
 import { beforeEach, describe, expect, it } from "vitest"
+import { startProxy } from "../proxy/server.js"
 import { SdkBackend } from "./sdk.js"
-import type { BackendEvent, BackendRunRequest } from "./types.js"
+import type { BackendEvent, BackendRunRequest, CursorBackend } from "./types.js"
 
 interface RunnerEvent {
   type: string
@@ -107,6 +109,44 @@ async function collect(events: AsyncIterable<BackendEvent>): Promise<BackendEven
 describe("sdk backend sessions", () => {
   beforeEach(() => {
     process.env.OPENCODEV2_CURSOR_CACHE = fs.mkdtempSync(path.join(os.tmpdir(), "opencodev2-cursor-sdk-"))
+  })
+
+  it("shares an in-flight connection between concurrent sessions", async () => {
+    let connections = 0
+    const runner = new ScriptedRunner({
+      onTurn(cmd, push) {
+        push({ type: "done", text: cmd.sessionKey, requestId: cmd.requestId })
+      },
+    })
+    const backend = new SdkBackend(async () => "test-key", {
+      connect: async () => {
+        connections += 1
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return runner
+      },
+    })
+    const results = await Promise.all([
+      collect(backend.run(request("connect-a"))),
+      collect(backend.run(request("connect-b"))),
+    ])
+    expect(results.map((events) => events.at(-1))).toEqual([
+      { type: "done", text: "connect-a" },
+      { type: "done", text: "connect-b" },
+    ])
+    expect(connections).toBe(1)
+  })
+
+  it("removes abort listeners after keepalives and completion", async () => {
+    const runner = new ScriptedRunner({
+      onTurn(cmd, push) {
+        for (let i = 0; i < 20; i++) push({ type: "keepalive", requestId: cmd.requestId })
+        push({ type: "done", text: "finished", requestId: cmd.requestId })
+      },
+    })
+    const backend = new SdkBackend(async () => "test-key", { connect: () => runner })
+    const turn = request("listeners")
+    await collect(backend.run(turn))
+    expect(getEventListeners(turn.signal, "abort")).toHaveLength(0)
   })
 
   it("lets a second session finish while the first is paused on a tool call", async () => {
@@ -255,5 +295,79 @@ describe("sdk backend sessions", () => {
     const next = await collect(backend.run(request("session-a")))
     expect(next.at(-1)).toEqual({ type: "done", text: "respawned" })
     expect(workers).toBe(2)
+  })
+
+  it("keeps a quiet live chat open past the idle timeout until the model replies", async () => {
+    const runner = new ScriptedRunner({
+      onTurn(cmd, push) {
+        const pulse = setInterval(() => push({ type: "keepalive", requestId: cmd.requestId }), 80)
+        setTimeout(() => {
+          clearInterval(pulse)
+          push({ type: "text", text: "still here", requestId: cmd.requestId })
+          push({ type: "done", text: "still here", requestId: cmd.requestId })
+        }, 700)
+      },
+    })
+    const sdk = new SdkBackend(async () => "test-key", {
+      connect: () => runner,
+      idleTimeoutMs: 250,
+      turnTimeoutMs: 5_000,
+    })
+    const unused = (id: "cli" | "native"): CursorBackend => ({
+      id,
+      async listModels() { return [] },
+      async *run() { /* The chat uses the SDK backend. */ },
+    })
+    const proxy = await startProxy({
+      getAuth: async () => ({ kind: "api-key", apiKey: "test-key" }),
+      backends: { cli: unused("cli"), sdk, native: unused("native") },
+      fallbackDirectory: () => process.cwd(),
+      models: () => [],
+      idleTimeoutMs: 250,
+      turnTimeoutMs: 5_000,
+    })
+    try {
+      const started = Date.now()
+      const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "grok-4.7",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      })
+      const body = await response.text()
+      expect(Date.now() - started).toBeGreaterThanOrEqual(500)
+      expect(body).toContain("still here")
+      expect(body).not.toContain("No Cursor output")
+    } finally {
+      await proxy.close()
+    }
+  })
+
+  it("ends a quiet live run at the turn cap", async () => {
+    let pulse: ReturnType<typeof setInterval> | undefined
+    const runner = new ScriptedRunner({
+      onTurn(cmd, push) {
+        pulse = setInterval(() => push({ type: "keepalive", requestId: cmd.requestId }), 30)
+      },
+    })
+    const backend = new SdkBackend(async () => "test-key", {
+      connect: () => runner,
+      idleTimeoutMs: 80,
+      turnTimeoutMs: 350,
+    })
+    try {
+      const started = Date.now()
+      const events = await collect(backend.run(request("capped")))
+      const last = events.at(-1)
+      expect(last?.type).toBe("error")
+      expect(last?.type === "error" ? last.message : "").toContain("Cursor turn timed out")
+      expect(Date.now() - started).toBeGreaterThanOrEqual(300)
+      expect(Date.now() - started).toBeLessThan(1_000)
+    } finally {
+      if (pulse) clearInterval(pulse)
+    }
   })
 })
